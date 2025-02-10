@@ -1,40 +1,28 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Depends
 from fastapi.responses import JSONResponse
-import pdfminer.high_level
-from ebooklib import epub
-import sqlite3
-import os
+from sqlalchemy.orm import Session
+from database import SessionLocal, engine
 from extract import extract_text_from_pdf, extract_text_from_epub
+import models
+
+# Create the database tables
+models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
 
-# Database setup
-DB_FILE = "books.db"
-if not os.path.exists(DB_FILE):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE books (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT,
-            content TEXT,
-            last_read_position INTEGER DEFAULT 0
-        )
-    """)
-    conn.commit()
-    conn.close()
 
-
-def get_db_connection():
-    """Connect to SQLite database."""
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row  # Enable fetching results as dictionaries
-    return conn
+# Dependency: Get database session
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 
 # 📌 Upload file endpoint (PDF/EPUB)
 @app.post("/upload/")
-async def upload_book(file: UploadFile = File(...)):
+async def upload_book(file: UploadFile = File(...), db: Session = Depends(get_db)):
     # Check file type
     if file.filename.endswith(".pdf"):
         text = extract_text_from_pdf(await file.read())
@@ -44,55 +32,43 @@ async def upload_book(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Only PDF and EPUB files are supported")
 
     # Store in database
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("INSERT INTO books (title, content) VALUES (?, ?)", (file.filename, text))
-    conn.commit()
-    conn.close()
+    new_book = models.Book(title=file.filename, text=text)
+    db.add(new_book)
+    db.commit()
+    db.refresh(new_book)
 
-    return JSONResponse(content={"message": "Book uploaded successfully!", "title": file.filename})
-
+    return JSONResponse(content={"message": "Book uploaded successfully!", "title": new_book.title, "id": new_book.id})
 
 
 # 📌 Fetch all books
 @app.get("/books/")
-def get_all_books():
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT id, title, last_read_position FROM books")
-    books = c.fetchall()
-    conn.close()
-
-    return [{"id": book["id"], "title": book["title"], "last_read_position": book["last_read_position"]} for book in books]
+def get_all_books(db: Session = Depends(get_db)):
+    books = db.query(models.Book).all()
+    return [{"id": book.id, "title": book.title} for book in books]
 
 
 # 📌 Fetch a single book by ID
 @app.get("/books/{book_id}")
-def get_book(book_id: int):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT * FROM books WHERE id = ?", (book_id,))
-    book = c.fetchone()
-    conn.close()
+def get_book(book_id: int, db: Session = Depends(get_db)):
+    book = db.query(models.Book).filter(models.Book.id == book_id).first()
 
     if book is None:
         raise HTTPException(status_code=404, detail="Book not found")
 
-    return {
-        "id": book["id"],
-        "title": book["title"],
-        "content": book["content"],
-        "last_read_position": book["last_read_position"]
-    }
+    return {"id": book.id, "title": book.title, "content": book.text}
 
 
 # 📌 Save last read position
 @app.patch("/books/{book_id}/resume")
-def update_last_read_position(book_id: int, last_position: int = Query(..., description="Last position read")):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("UPDATE books SET last_read_position = ? WHERE id = ?", (last_position, book_id))
-    conn.commit()
-    conn.close()
+def update_last_read_position(book_id: int, last_position: int = Query(..., description="Last position read"),
+                              db: Session = Depends(get_db)):
+    book_progress = db.query(models.ReadingProgress).filter(models.ReadingProgress.book_id == book_id).first()
 
+    if book_progress:
+        book_progress.position = last_position
+    else:
+        book_progress = models.ReadingProgress(book_id=book_id, position=last_position)
+        db.add(book_progress)
+
+    db.commit()
     return {"message": "Last read position updated", "book_id": book_id, "last_read_position": last_position}
