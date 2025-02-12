@@ -15,6 +15,7 @@ lxml==5.3.0
 pdfminer.six==20240706
 pydantic==2.10.6
 pydantic_core==2.27.2
+python-multipart==0.0.20
 requests==2.32.3
 SQLAlchemy==2.0.38
 starlette==0.45.3
